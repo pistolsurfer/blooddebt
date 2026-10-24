@@ -1,0 +1,763 @@
+--[[
+    Blood Debt ESP (optimized)
+
+    What changed vs. the original:
+      * Weapon lookups are normalized (lowercase, punctuation stripped), so "FT100" / "FT-100" and
+        "Fleet-K51" / "Fleet K51" all match. Roles are found by checking each player's few tools
+        against hash sets instead of looping over ~170 weapon names per player.
+      * Each player's tools are scanned once per tick (was 2-4 times).
+      * Highlights / nametags are reused and only touched when something changed (no more
+        destroy + recreate every 0.5s, so no flicker and far less garbage).
+      * Hint text is parsed only when it changes, and the hint signal / WaitForChild(20) is gone.
+      * Dropped-gun ESP is event driven (ChildAdded / ChildRemoved) instead of polled.
+      * Connections are tracked and cleaned up (the old PlayerRemoving connection leaked on
+        every "Enable" click).
+      * Enable / Disable buttons merged into one toggle.
+      * Teleport picks the NEAREST dropped gun and uses PivotTo (SetPrimaryPartCFrame is deprecated).
+      * Detection runs inside pcall so one error can't kill the loop.
+      * Optional debug toggle that prints tool names the script doesn't recognise, so you can spot
+        new guns yourself after future updates.
+]]
+
+----------------------------------------------------------------------
+-- Services / setup
+----------------------------------------------------------------------
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local lp = Players.LocalPlayer
+
+local NPCSFolder = Workspace:WaitForChild("NPCSFolder", 15)
+local BloodFolder = Workspace:WaitForChild("BloodFolder", 15)
+
+local SCAN_INTERVAL = 0.5
+local DISTANCE_THRESHOLD = 30
+
+local Window = Rayfield:CreateWindow({
+    Name = "Blood Debt ESP",
+    Icon = 0,
+    LoadingTitle = "Blood Debt ESP",
+    LoadingSubtitle = "Role detector",
+    Theme = "Default",
+    DisableRayfieldPrompts = false,
+    DisableBuildWarnings = false,
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = nil,
+        FileName = "Big Hub",
+    },
+})
+
+local Tab = Window:CreateTab("Players", "rewind")
+
+local function notify(title, content, duration)
+    Rayfield:Notify({
+        Title = title,
+        Content = content,
+        Duration = duration or 3,
+        Image = 4483362458,
+    })
+end
+
+----------------------------------------------------------------------
+-- Weapon data
+-- (Sets are built from these lists with normalized names, see norm())
+----------------------------------------------------------------------
+local normCache = {}
+local function norm(name)
+    local cached = normCache[name]
+    if cached then return cached end
+    local n = name:lower():gsub("[^%w]", "")
+    normCache[name] = n
+    return n
+end
+
+local function buildSet(list)
+    local set = {}
+    for _, name in ipairs(list) do
+        set[norm(name)] = true
+    end
+    return set
+end
+
+local killerSet = buildSet({
+    "CharcoalSteel JS-22", "Pretty Pink RR-LCP", "JS2-BondsDerringy", "GILDED", "Kamatov",
+    "JS2-Derringy", "JS-22", "RR-LightCompactPistolS", "J9-Mereta", "RY's GG-17", "RR-LCP",
+    "JS1-Competitor", "AT's KAR15", "VK's ANKM", "Clothed Sawn-off", "Sawn-off",
+    "Clothed Rosen-Obrez", "Rosen-Obrez", "GraySteel K1911", "DarkSteel K1911",
+    "SilverSteel K1911", "K1911", "ZZ-90", "SKORPION", "Mares Leg", "RR-LightCompactPistol",
+    "KamatovS", "ChromeSlide Turqoise RR-LCP", "JS1-CYCLOPS", "THUMPA", "LUT-E 'KRUS'",
+    "Memories", "Hammer n Bullet", "JS-22GILDED", "Sawn-offGILDED", "Door'bler TIGERSTRIPES",
+    "Anatoly's JS-22", "PLASTIC JS-22", "JTS225-OBREZ", "HEARDBALLA", "Whiteout Rosen-Obrez",
+    "Whiteout RR-LCP", "JTS225-Obrez Monochrome", "JTS225-Obrez", "Sawn-off10",
+    "Nikolai's 'Dented'", "JS-44", "BandagePack", "JTS225-Obrez Poly", "Mares Leg10",
+    "RR-LCP10", "JTS225-Obrez Partycannon", "Bandages", "corrodedmetal JS-22",
+    "CharcoalSteel JS-44", "SKORPION10", "Meretta486Palubu Sawn-Off", "KamatovDRUM",
+    "Micro KZI", "Whiteout RR-LightCompactPistolS", "Clothed SKORPION",
+    "CharcoalSteel SKORPION", "Charcoal Steel SKORPION", "Katya's 'Memories'", "Dual SKORPS",
+    "HWISSH-KP9", "JS2-DerringyGILDED", "K1911GILDED", "Mandols-5", "RDG-2B", "Testament",
+    "Jolibri", "JAVELIN-OBREZS", "GZhG-7.62", "AGM22", "RR-Mark2", "Dual LCPs",
+    "RR-LightCompactPistolS10", "Wild Mandols-5", "AK47 Case Hardened 1000000", "Kensington20",
+    "Kensington", "ZOZ-106", "Whizz", "Rosen Nagan", "WISP", "WISP Pearl", "MAK-1020",
+    "SKORPION 'AMIRNOV", "PTRB-41", "Memorial", "Mooser", "VA's ANKM", "HW-K7",
+    "TG's JAVELIN-ZVD", "KR7S", "RUZKH-12", "TEKE-9", "TG's JTS225", "Mason's Machete",
+    "Pretty Pink RVK", "Comically Large Spoon", "Skeleton Rosen-Obrez", "Berf-JOLT",
+    "1895-Rosey", "K1911 'Memorial'", "APZ", "Door'bler", "JTS225-ObrezGILDED", "Casaro 91",
+    "Blase Sawn-off", "Gild Sawn-off", "Bouquet", "RR-MarkII", "Steel 1895-Rosey",
+    "Sawed-THUMPA", "Gild JS", "ZT-33", "FT100", "J21a Meretta", "JS", "Daniqui-Obrez",
+    "Cute RR-LCPS", "Gisil-Pistole", "Camo RR-LCPS", "JS-22 Sealed", "Steel Mares Leg",
+    "Pol357", "'Desperation'", "Bezzhumny", "Party Cannon JTS225-Obrez", "Gild K1911",
+    "ZT-33 (Golden)", "Fleet-K51", "Gild Rosen-Obrez", "ZZ-71", "Kr7s", "K1911 Threaded",
+    "PPm-41", "Lenitrovyak-23", "OTz-02 ", "ZOZ-106SCOPED", "MAK-10", "Unioned PPm-41",
+    "PRIDE SCORPION", "LUT-E 'PIP'", "JSK-44", "Gild JTS225-Obrez", "Gild Gisil-Pistole",
+    "Steel Rosen-Obrez", "410BONDS-Derringy", "H&W-K7", "Cute JS2-Derringy",
+
+    -- Added from the Blood Debt wiki (International Affairs update / gun tables)
+    "Dual Micro KZI",   -- replaced Micro KZI as of the 3/8/2026 update
+    "Bezzhummy",        -- wiki spelling (script already had "Bezzhumny")
+    "Dual RR-LCP",      -- wiki name for the dual LCPs
+    "RR-LCP 10M",       -- 10M badge variant
+})
+
+local vigilanteSet = buildSet({
+    "Beagle", "Beagle TIGERSTRIPES", "Paradise Beagle", "IZVEKH-412", "SilverSteel RR-Snubby",
+    "RR-Snubby", "ZKZ-Obrez", "GG-17", "J9-M", "J9-Meretta", "Pretty Pink GG-17", "GG-17 TAN",
+    "GG-17GILDED", "RR-SnubbyGILDED", "HWISSH-226", "ZKZ-Obrez10", "Buxxberg-COMPACT",
+    "Pretty Pink Buxxberg-COMPACT", "JS-5A-Obrez", "Dual Elites", "RR-Snubby10", "DRICO",
+    "HW-M5K", "CharcoalSteel I412", "GG-1720", "Dual GG-17s", "Mini Ranch Rifle",
+    "Clothed ZKZ-Obrez", "Case Hardened DRICO", "KriegsHerr-9", "H&W-MPi5K", "'Paradise'",
+    "Beagle-44", "Dual Merettas", "GG-26", "HWISSH-226 SHIELD", "ANKO46", "Unioned ZKZ-Obrez",
+    "PRIDE H-226 SHIELD", "SAKURA ZKZ-Obrez", "R&E M10", "Gild GG-17", "Gild J9a1 M",
+    "Gild ZKZ-Obrez", "SHOT-7", "SWAG-7", "J9a1 Meretta", "Steel R&E Snubby", "Beagle-50",
+    "R&E Snubby",
+
+    -- Added from the Blood Debt wiki
+    "HW-226",           -- wiki name of the HWISSH-226 default vigilante pistol
+    "RR-Snubby 10M",    -- 10M badge variant
+})
+
+local specialSet = buildSet({
+    "RY's GG-17", "AT's KAR15", "VK's ANKM", "VA's ANKM", "RVK", "GZhG-7.62",
+    "AK47 Case Hardened 1000000", "TG's JAVELIN-ZVD", "Mason's Machete", "Pretty Pink RVK",
+})
+
+local juggernautSet = buildSet({
+    "AK47 Case Hardened 1000000", "RVK", "Pretty Pink RVK",
+})
+
+----------------------------------------------------------------------
+-- Roles
+----------------------------------------------------------------------
+local ROLES = {
+    killer        = { color = Color3.fromRGB(255, 0, 0),     label = "KILLER" },
+    innocent      = { color = Color3.fromRGB(0, 255, 0),     label = "INNOCENT" },
+    vigilante     = { color = Color3.fromRGB(0, 255, 255),   label = "VIGILANTE" },
+    hint          = { color = Color3.new(1, 1, 0),           label = "HINT MATCH" },
+    vigilanteHint = { color = Color3.fromRGB(128, 0, 128),   label = "VIGILANTE + HINT MATCH" },
+    killerHint    = { color = Color3.fromRGB(255, 165, 0),   label = "KILLER + HINT MATCH" },
+}
+
+----------------------------------------------------------------------
+-- State
+----------------------------------------------------------------------
+local nametagMode = "Role" -- "Role" | "Username" | "Character Name"
+local debugUnknown = false
+
+local espEnabled = false
+local loopToken = 0
+local connections = {}
+
+local lockedByDistance = false
+local lockedRoles = {}
+
+local tagCache = setmetatable({}, { __mode = "k" }) -- [player] = {char, role, text}
+local unknownSeen = {}
+
+----------------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------------
+local function trim(s)
+    return s:match("^%s*(.-)%s*$") or ""
+end
+
+local NAME_KEYS = { "CharacterName", "NPCName", "Name" }
+
+local function getCharacterName(player)
+    local model = NPCSFolder and NPCSFolder:FindFirstChild(player.Name)
+    if model then
+        for _, key in ipairs(NAME_KEYS) do
+            local v = model:FindFirstChild(key)
+            if v and v:IsA("StringValue") then return v.Value end
+        end
+
+        local config = model:FindFirstChild("Configuration")
+        if config then
+            for _, key in ipairs(NAME_KEYS) do
+                local v = config:FindFirstChild(key)
+                if v and v:IsA("StringValue") then return v.Value end
+            end
+        end
+
+        local hum = model:FindFirstChildOfClass("Humanoid")
+        if hum and hum.DisplayName ~= "" and hum.DisplayName ~= player.Name then
+            return hum.DisplayName
+        end
+    end
+    return player.Name
+end
+
+local function logUnknown(name)
+    if unknownSeen[name] then return end
+    unknownSeen[name] = true
+    print(("[BloodDebtESP] Unrecognised tool: %q"):format(name))
+end
+
+----------------------------------------------------------------------
+-- Highlight / nametag handling
+----------------------------------------------------------------------
+local function clearCharacter(char)
+    if not char then return end
+    local hl = char:FindFirstChild("RoleHighlight")
+    if hl then hl:Destroy() end
+    local head = char:FindFirstChild("Head")
+    if head then
+        local bb = head:FindFirstChild("RoleBillboard")
+        if bb then bb:Destroy() end
+    end
+end
+
+local function getDisplayText(player, role)
+    if nametagMode == "Username" then
+        return player.Name
+    elseif nametagMode == "Character Name" then
+        return getCharacterName(player)
+    end
+    return role.label
+end
+
+local function applyTag(player, char, role)
+    local text = getDisplayText(player, role)
+    local head = char:FindFirstChild("Head")
+
+    -- Skip all work if nothing changed and the instances still exist
+    local cache = tagCache[player]
+    if cache and cache.char == char and cache.role == role and cache.text == text
+        and char:FindFirstChild("RoleHighlight")
+        and (not head or head:FindFirstChild("RoleBillboard")) then
+        return
+    end
+
+    local highlight = char:FindFirstChild("RoleHighlight")
+    if not highlight then
+        highlight = Instance.new("Highlight")
+        highlight.Name = "RoleHighlight"
+        highlight.Archivable = true
+        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+        highlight.FillTransparency = 0.5
+        highlight.OutlineTransparency = 0
+        highlight.Enabled = true
+        highlight.Parent = char
+    end
+    highlight.FillColor = role.color
+
+    if head then
+        local bb = head:FindFirstChild("RoleBillboard")
+        local label
+        if not bb then
+            bb = Instance.new("BillboardGui")
+            bb.Name = "RoleBillboard"
+            bb.Size = UDim2.new(0, 100, 0, 20)
+            bb.StudsOffset = Vector3.new(0, 2.5, 0)
+            bb.Adornee = head
+            bb.AlwaysOnTop = true
+
+            label = Instance.new("TextLabel")
+            label.Name = "RoleLabel"
+            label.Size = UDim2.new(1, 0, 1, 0)
+            label.BackgroundTransparency = 1
+            label.TextStrokeTransparency = 0.2
+            label.TextScaled = true
+            label.Font = Enum.Font.SourceSansBold
+            label.Parent = bb
+
+            bb.Parent = head
+        else
+            label = bb:FindFirstChild("RoleLabel")
+        end
+        if label then
+            label.Text = text
+            label.TextColor3 = role.color
+        end
+    end
+
+    tagCache[player] = { char = char, role = role, text = text }
+end
+
+----------------------------------------------------------------------
+-- Tool scanning (one pass per player per tick)
+----------------------------------------------------------------------
+local function scanContainer(container, info)
+    if not container then return end
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("Tool") then
+            local key = norm(child.Name)
+            local isKiller = killerSet[key]
+            local isVig = vigilanteSet[key]
+            local isSpecial = specialSet[key]
+
+            if isSpecial then
+                info.special = true
+                if juggernautSet[key] then info.juggernaut = true end
+            end
+            if isKiller or isVig then info.anyRole = true end
+            if isVig then info.vigilante = true end
+            if isKiller then
+                info.killer = true
+                if not isSpecial then info.standardKiller = true end
+            end
+
+            if debugUnknown and not (isKiller or isVig or isSpecial) then
+                logUnknown(child.Name)
+            end
+        end
+    end
+end
+
+local function scanPlayer(player)
+    local info = {
+        special = false,        -- holds a "special killer" weapon
+        juggernaut = false,     -- holds a juggernaut weapon
+        anyRole = false,        -- holds any killer/vigilante weapon
+        vigilante = false,
+        killer = false,         -- any killerSet weapon (includes special ones)
+        standardKiller = false, -- killerSet weapon that is NOT special
+    }
+    scanContainer(player:FindFirstChildOfClass("Backpack"), info)
+    scanContainer(player.Character, info)
+    if NPCSFolder then
+        scanContainer(NPCSFolder:FindFirstChild(player.Name), info)
+    end
+    return info
+end
+
+----------------------------------------------------------------------
+-- Hint parsing (cached by hint text)
+----------------------------------------------------------------------
+local HINT_PREFIX = "hints : "
+local hintCache = { text = nil, conditions = nil }
+
+local function parseSingleHint(content)
+    content = trim(content)
+    if content == "" then return nil end
+
+    local task = content:match("^Is often seen%s*(.*)$")
+    if task then return "task", trim(task) end
+
+    if content:match("^%[.-%]$") then
+        local clue = trim((content:gsub("[%[%]]", "")))
+        local lower = clue:lower()
+        if clue ~= "" and lower ~= "assigned task" and lower ~= "seen" then
+            return "trait", clue
+        end
+    end
+
+    return "trait", content
+end
+
+local function parseHintText(text)
+    if trim(text) == "" then return nil end
+    if text:sub(1, #HINT_PREFIX):lower() ~= HINT_PREFIX then return nil end
+
+    local body = trim(text:sub(#HINT_PREFIX + 1))
+
+    local parts, pos = {}, 1
+    while true do
+        local s, e = body:find(" + ", pos, true)
+        if not s then
+            parts[#parts + 1] = body:sub(pos)
+            break
+        end
+        parts[#parts + 1] = body:sub(pos, s - 1)
+        pos = e + 1
+    end
+
+    local groups, any = {}, false
+    for _, part in ipairs(parts) do
+        local num = tonumber(part:match("^%[%s*(%d+)%s*%]")) or 1
+        local cleaned = trim((part:gsub("^%[%s*%d+%s*%]%s*", "")))
+        local ctype, cvalue = parseSingleHint(cleaned)
+        if ctype and cvalue and cvalue ~= "" then
+            groups[num] = groups[num] or {}
+            table.insert(groups[num], { type = ctype, value = cvalue })
+            any = true
+        end
+    end
+
+    return any and groups or nil
+end
+
+local function getHintConditions()
+    local gui = lp:FindFirstChild("PlayerGui")
+    local status = gui and gui:FindFirstChild("RESETONDEATHStatusGui")
+    local label = status and status:FindFirstChild("TARGETHINT")
+    if not label or not label:IsA("TextLabel") then return nil end
+
+    local text = label.Text
+    if text ~= hintCache.text then
+        hintCache.text = text
+        hintCache.conditions = parseHintText(text)
+    end
+    return hintCache.conditions
+end
+
+local function collectTraits(model)
+    local traits = {}
+    local config = model:FindFirstChild("Configuration")
+    if config then
+        for _, child in ipairs(config:GetChildren()) do
+            if child:IsA("StringValue") then traits[child.Value] = true end
+        end
+    end
+    return traits
+end
+
+local EMPTY = {}
+
+local function matchHints(infos)
+    if not NPCSFolder then return EMPTY end
+    local groups = getHintConditions()
+    if not groups then return EMPTY end
+
+    local matches = {}
+    for player in pairs(infos) do
+        local model = NPCSFolder:FindFirstChild(player.Name)
+        if model then
+            local traits -- built lazily, once per player
+            for _, conditions in pairs(groups) do
+                local allMet = true
+                for _, cond in ipairs(conditions) do
+                    local met
+                    if cond.type == "task" then
+                        local t = model:FindFirstChild("AssignedTask")
+                        met = t ~= nil and t:IsA("StringValue") and t.Value == cond.value
+                    else
+                        traits = traits or collectTraits(model)
+                        met = traits[cond.value] == true
+                    end
+                    if not met then
+                        allMet = false
+                        break
+                    end
+                end
+                if allMet then
+                    matches[player] = true
+                    break
+                end
+            end
+        end
+    end
+    return matches
+end
+
+----------------------------------------------------------------------
+-- Role detection
+----------------------------------------------------------------------
+local function unlockDistance()
+    lockedByDistance = false
+    lockedRoles = {}
+end
+
+local function detectRoles()
+    if not espEnabled then return end
+
+    local infos, validCount = {}, 0
+    local vigilanteCount, killerHolderCount, killerCandidate = 0, 0, nil
+    local specialDetected, juggernautHolder = false, nil
+    local anyArmed, everyoneArmed = false, true
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        local char = player.Character
+        if player ~= lp and char and char:FindFirstChild("HumanoidRootPart") then
+            local info = scanPlayer(player)
+            infos[player] = info
+            validCount += 1
+
+            if info.special then specialDetected = true end
+            if info.juggernaut then juggernautHolder = player end
+            if info.vigilante then vigilanteCount += 1 end
+            if info.killer then
+                killerHolderCount += 1
+                killerCandidate = player
+            end
+            if info.anyRole then anyArmed = true else everyoneArmed = false end
+        else
+            if char then clearCharacter(char) end
+            tagCache[player] = nil
+        end
+    end
+
+    -- Highest priority: exactly one vigilante weapon + exactly one killer weapon on the map
+    local singleKiller = nil
+    if vigilanteCount == 1 and killerHolderCount == 1 and killerCandidate then
+        singleKiller = killerCandidate
+        specialDetected = false
+        juggernautHolder = nil
+        unlockDistance()
+    end
+
+    local higherPriority = singleKiller ~= nil or juggernautHolder ~= nil or specialDetected
+
+    -- Distance lock
+    if not higherPriority then
+        if validCount > 0 and everyoneArmed and not lockedByDistance then
+            local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                lockedByDistance = true
+                lockedRoles = {}
+                for player in pairs(infos) do
+                    local ph = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+                    if ph then
+                        local far = (hrp.Position - ph.Position).Magnitude >= DISTANCE_THRESHOLD
+                        lockedRoles[player] = far and "Killer" or "Innocent"
+                    end
+                end
+            else
+                warn("BloodDebtESP: distance lock failed, local HumanoidRootPart missing")
+            end
+        elseif validCount > 0 and not anyArmed and lockedByDistance then
+            unlockDistance()
+        end
+    elseif lockedByDistance then
+        unlockDistance()
+    end
+
+    local hintMatches = matchHints(infos)
+
+    -- Apply tags
+    for player, info in pairs(infos) do
+        local char = player.Character
+        if char then
+            local role
+
+            if singleKiller and player == singleKiller then
+                role = ROLES.killer
+            elseif juggernautHolder then
+                if player == juggernautHolder then
+                    role = ROLES.killer
+                elseif info.anyRole then
+                    role = ROLES.vigilante
+                else
+                    role = ROLES.innocent
+                end
+            elseif specialDetected then
+                role = info.special and ROLES.killer or ROLES.innocent
+            elseif lockedByDistance then
+                local locked = lockedRoles[player]
+                if locked == "Killer" then
+                    role = ROLES.killer
+                elseif locked == "Innocent" then
+                    role = ROLES.innocent
+                end -- else: no locked role (joined late) -> cleared below
+            elseif hintMatches[player] then
+                if info.vigilante then
+                    role = ROLES.vigilanteHint
+                elseif info.standardKiller then
+                    role = ROLES.killerHint
+                else
+                    role = ROLES.hint
+                end
+            elseif info.standardKiller then
+                role = ROLES.killer
+            elseif info.vigilante then
+                role = ROLES.vigilante
+            else
+                role = ROLES.innocent
+            end
+
+            if role then
+                applyTag(player, char, role)
+            else
+                clearCharacter(char)
+                tagCache[player] = nil
+            end
+        end
+    end
+end
+
+----------------------------------------------------------------------
+-- Dropped gun ESP (event driven)
+----------------------------------------------------------------------
+local function isGunName(name)
+    local key = norm(name)
+    return killerSet[key] or vigilanteSet[key] or specialSet[key]
+end
+
+local function clearDroppedGunEsp(tool)
+    local hl = tool:FindFirstChild("DroppedGunHighlight")
+    if hl then hl:Destroy() end
+end
+
+local function addDroppedGunEsp(tool)
+    if not tool:IsA("Tool") or not isGunName(tool.Name) then return end
+    if tool:FindFirstChild("DroppedGunHighlight") then return end
+
+    local hl = Instance.new("Highlight")
+    hl.Name = "DroppedGunHighlight"
+    hl.Adornee = tool
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.FillColor = Color3.fromRGB(255, 255, 0)
+    hl.FillTransparency = 0.4
+    hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+    hl.OutlineTransparency = 0
+    hl.Enabled = true
+    hl.Parent = tool
+end
+
+local function clearAllDroppedGunEsp()
+    if not BloodFolder then return end
+    for _, obj in ipairs(BloodFolder:GetChildren()) do
+        if obj:IsA("Tool") then clearDroppedGunEsp(obj) end
+    end
+end
+
+local function teleportToDroppedGun()
+    if not BloodFolder then
+        notify("Error", "BloodFolder not found in Workspace.", 5)
+        return
+    end
+
+    local char = lp.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        notify("Error", "Cannot teleport: your character is not ready.", 5)
+        return
+    end
+
+    local bestHandle, bestDist
+    for _, tool in ipairs(BloodFolder:GetChildren()) do
+        if tool:IsA("Tool") and isGunName(tool.Name) then
+            local handle = tool:FindFirstChild("Handle")
+            if handle and handle:IsA("BasePart") then
+                local d = (handle.Position - hrp.Position).Magnitude
+                if not bestDist or d < bestDist then
+                    bestHandle, bestDist = handle, d
+                end
+            end
+        end
+    end
+
+    if bestHandle then
+        char:PivotTo(CFrame.new(bestHandle.Position + Vector3.new(0, 5, 0)))
+    else
+        notify("No Gun Found", "There are no valid guns in the BloodFolder.", 5)
+    end
+end
+
+----------------------------------------------------------------------
+-- Enable / disable
+----------------------------------------------------------------------
+local function disconnectAll()
+    for _, c in ipairs(connections) do
+        if c.Connected then c:Disconnect() end
+    end
+    connections = {}
+end
+
+local function enableEsp()
+    if espEnabled then return end
+    espEnabled = true
+    loopToken += 1
+    local token = loopToken
+
+    task.spawn(function()
+        while espEnabled and token == loopToken do
+            local ok, err = pcall(detectRoles)
+            if not ok then warn("BloodDebtESP: detectRoles error: " .. tostring(err)) end
+            task.wait(SCAN_INTERVAL)
+        end
+    end)
+
+    table.insert(connections, Players.PlayerRemoving:Connect(function(player)
+        if player.Character then clearCharacter(player.Character) end
+        tagCache[player] = nil
+        lockedRoles[player] = nil
+    end))
+
+    if BloodFolder then
+        for _, obj in ipairs(BloodFolder:GetChildren()) do
+            addDroppedGunEsp(obj)
+        end
+        table.insert(connections, BloodFolder.ChildAdded:Connect(addDroppedGunEsp))
+        table.insert(connections, BloodFolder.ChildRemoved:Connect(function(child)
+            if child:IsA("Tool") then clearDroppedGunEsp(child) end
+        end))
+    end
+
+    notify("ESP Enabled", "Role detection has been turned on.")
+end
+
+local function disableEsp()
+    if not espEnabled then return end
+    espEnabled = false
+    loopToken += 1
+    disconnectAll()
+
+    unlockDistance()
+    hintCache.text, hintCache.conditions = nil, nil
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Character then clearCharacter(player.Character) end
+        tagCache[player] = nil
+    end
+    clearAllDroppedGunEsp()
+
+    notify("ESP Disabled", "Role detection and dropped gun ESP have been turned off.")
+end
+
+----------------------------------------------------------------------
+-- UI
+----------------------------------------------------------------------
+Tab:CreateToggle({
+    Name = "Role ESP",
+    CurrentValue = false,
+    Flag = "RoleEspToggle",
+    Callback = function(value)
+        if value then enableEsp() else disableEsp() end
+    end,
+})
+
+Tab:CreateDropdown({
+    Name = "Nametag Display Mode",
+    Options = { "Role", "Username", "Character Name" },
+    CurrentOption = { "Role" },
+    MultipleOptions = false,
+    Flag = "NametagModeDropdown",
+    Callback = function(option)
+        local choice = type(option) == "table" and option[1] or option
+        nametagMode = choice or "Role"
+        if espEnabled then
+            local ok, err = pcall(detectRoles)
+            if not ok then warn("BloodDebtESP: detectRoles error: " .. tostring(err)) end
+        end
+        notify("Nametag Mode Changed", "Now displaying: " .. nametagMode)
+    end,
+})
+
+Tab:CreateButton({
+    Name = "Teleport to Nearest Dropped Gun",
+    Callback = teleportToDroppedGun,
+})
+
+Tab:CreateToggle({
+    Name = "Log unrecognised tools (debug)",
+    CurrentValue = false,
+    Flag = "DebugUnknownToggle",
+    Callback = function(value)
+        debugUnknown = value
+        if value then unknownSeen = {} end
+    end,
+})
+
+notify("Blood Debt ESP", "Script loaded.", 4)
